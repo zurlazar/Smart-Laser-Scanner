@@ -7,6 +7,27 @@ import bisect
 import threading
 import numpy as np
 import sys
+import os
+import ctypes
+
+def reset_network():
+    print("[SYSTEM] Performing pre-flight network reset...")
+    # Disabling/Enabling requires Admin rights
+    os.system('netsh interface set interface "Ethernet" admin=disable')
+    os.system('timeout /t 2')
+    os.system('netsh interface set interface "Ethernet" admin=enable')
+    os.system('arp -d *')
+    print("[SYSTEM] Network reset complete.")
+
+
+# Run this before starting the socket listener
+if __name__ == "__main__":
+    # Check for Admin rights before attempting reset
+    if ctypes.windll.shell32.IsUserAnAdmin():
+        reset_network()
+    else:
+        print("[WARNING] Not running as Admin. Skipping network reset.")
+
 
 # ---------------------------------------------------------
 # CONFIGURATION (Updated for 1920x1440)
@@ -16,7 +37,7 @@ PORT = 65432
 DEV_NAME = 'Dev1'      # Change this to match your NI MAX device name
 X_MAX = 1920           # Updated from 3840
 Y_MAX = 1440           # Updated from 2160
-AO_RANGE = 5.0         # Output voltage range (+/- 5V)
+AO_RANGE = 6.0         # Output voltage range (+/- 5V)
 EXPECTED_CAL_POINTS = 20
 
 # NOTE: Max update rate for USB-6001 is ~150Hz.
@@ -27,24 +48,24 @@ DAQ_RATE_HZ = 150.0
 # ---------------------------------------------------------
 # Initial Calibration Points (Pixel -> Voltage) - Scaled for 1920x1440
 X_CALIBRATION_POINTS = [
-    (125, -5.5),    # Scaled from (250, -5.5)
+    (125, -6),    # Scaled from (250, -5.5)
     (310, -4.5),    # Scaled from (620, -4.5)
     (550, -3.5),    # Scaled from (1100, -3.5)
     (733, -2.0),    # Scaled from (1466, -2.0)
     (1008, -1.2),   # Scaled from (2016, -1.2)
-    (1243, -0.5),   # Scaled from (2486, -0.5)
+    (1243, 0.5),   # Scaled from (2486, -0.5)
     (1500, 3),      # Scaled from (3000, 2)
-    (1750, 5.5)     # Scaled from (3500, 4.5)
+    (1750, 5)     # Scaled from (3500, 4.5)
 ]
 
 Y_CALIBRATION_POINTS = [
-    (0, -5.0),      # Same
+    (0, -5.5),      # Same
     (200, -4),      # Scaled from (300, -2)
     (400, -2),      # Scaled from (600, -1)
     (600, 0),       # Scaled from (900, 0)
     (800, 2),       # Scaled from (1200, 1)
     (1000, 4),      # Scaled from (1500, 2)
-    (1333, 5.0)     # Scaled from (2000, 3.0)
+    (1333, 5.5)     # Scaled from (2000, 3.0)
 ]
 
 # Run-time Lookup Tables
@@ -149,24 +170,31 @@ def create_continuous_batch_task():
     return daq_task
 
 def stop_continuous_batch():
-    """Stops and closes the global continuous batch task and moves the galvo to (0,0)V."""
-    global CONTINUOUS_BATCH_TASK
-    # Try to write (0,0)V to the single-point task FIRST to immediately stop movement
-    try:
-        if SINGLE_POINT_TASK:
-            SINGLE_POINT_TASK.write([0.0, 0.0], auto_start=True)
-    except:
-        pass
-
+    global CONTINUOUS_BATCH_TASK, SINGLE_POINT_TASK
+    
+    # 1. Kill the continuous task FIRST and FORCIBLY
     if CONTINUOUS_BATCH_TASK is not None:
         try:
-            CONTINUOUS_BATCH_TASK.stop()
+            # Abort is sometimes safer than stop during an underflow error
+            CONTINUOUS_BATCH_TASK.control(nidaqmx.constants.TaskMode.TASK_ABORT) 
             CONTINUOUS_BATCH_TASK.close() 
             print("ACK: CONTINUOUS STREAMING STOPPED AND TASK CLOSED.")
         except Exception as e:
-            print(f"Error stopping/closing continuous batch task: {e}")
+            print(f"Forced close on continuous task: {e}")
         finally:
             CONTINUOUS_BATCH_TASK = None
+
+    # 2. Small delay (0.01s) to let the NI-DAQ driver release the hardware
+    time.sleep(0.01)
+
+    # 3. Now that Dev1 is free, use the Single Point task to zero the mirrors
+    # try:
+    #     if SINGLE_POINT_TASK:
+    #         # Re-start the task if it was stopped by a previous error
+    #         SINGLE_POINT_TASK.write([0.0, 0.0], auto_start=True)
+    # except Exception as e:
+    #     print(f"Could not zero mirrors: {e}")
+
 
 def write_and_start_continuous_batch(x_voltages, y_voltages):
     """Writes the full voltage arrays to the continuous DAQ buffer and starts the task."""
@@ -279,6 +307,7 @@ def main():
             print(f"Listening on {HOST}:{PORT}...")
 
             conn, addr = s.accept()
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             print(f"Connected by {addr}")
 
             # Reset state for initial connection
@@ -300,17 +329,31 @@ def main():
 
                     while "\n" in buffer:
                         line, buffer = buffer.split("\n", 1)
+                        if line == "CALIBRATION_START":
+                            stop_continuous_batch()
+                            CALIBRATION_VOLTAGE_POINTS.clear()
+                            IS_LOGGING_VOLTAGES = True
+                            print("\n[SERVER] RECEIVED CALIBRATION START SIGNAL. Awaiting voltage/pixel pairs.")
+                            continue
 
                         # --- LASING START/STOP HANDLERS ---
                         if line == "LASING_START":
                             LASER_ON = True
-                            print("\n[SERVER] RECEIVED LASING START SIGNAL. Enabling laser trigger on moves.")
+                            print("\n[SERVER] LASER ARMED")
                             continue
 
-                        if line == "LASING_END":
+                        elif line.startswith("DWELL_MS="):
+                            try:
+                                dwell_time = float(line.split("=")[1]) / 1000.0 # Convert ms to seconds
+                                print(f"[SERVER] Dwell set to: {dwell_time*1000:.1f}ms")
+                            except:
+                                pass
+                            continue
+
+                        elif line == "LASING_END":
                             LASER_ON = False
-                            set_laser_output(False) # Ensure laser is off
-                            print("\n[SERVER] RECEIVED LASING END SIGNAL. Disabling laser trigger.")
+                            set_laser_output(False)
+                            print("[SERVER] LASER DISARMED")
                             continue
 
                         # --- BATCH START/STOP HANDLERS ---
@@ -352,7 +395,18 @@ def main():
 
                                 X_CAL_FINAL.sort(key=lambda p: p[0])
                                 Y_CAL_FINAL.sort(key=lambda p: p[0])
-
+                                
+                                # --- ADDED: PRINT CALIBRATION PAIRS ---
+                                print("\n--- FINAL CALIBRATION MAPPINGS ---")
+                                print("INDEX | PIXEL (X, Y)     | VOLTAGE (VX, VY)")
+                                print("-------------------------------------------")
+                                for i in range(len(X_CAL_FINAL)):
+                                    # Matching by index since both lists are sorted/aligned
+                                    p_x, v_x = X_CAL_FINAL[i]
+                                    p_y, v_y = Y_CAL_FINAL[i]
+                                    print(f"{i:5} | ({p_x:4}, {p_y:4})   | ({v_x:7.4f}, {v_y:7.4f})")
+                                print("-------------------------------------------\n")
+                                
                                 update_lookup_tables(X_CAL_FINAL, Y_CAL_FINAL)
                             else:
                                 print(f"ERROR: Calibration point count mismatch. Logged: {volt_count}V, {pix_count}P. Recalibration aborted.")
@@ -394,8 +448,8 @@ def main():
                             # Handle Laser Pulse Logic
                             if LASER_ON:
                                 set_laser_output(True)
-                                time.sleep(0.01) # 10ms delay
-
+                                time.sleep(dwell_time)
+                                
                             # Write to the DAQ hardware using the single-point task
                             SINGLE_POINT_TASK.write([v_x, v_y], auto_start=True)
 
